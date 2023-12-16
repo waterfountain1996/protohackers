@@ -1,0 +1,291 @@
+package main
+
+import (
+	"bufio"
+	"io"
+	"log"
+	"net"
+	"slices"
+	"strings"
+	"sync"
+	"time"
+)
+
+const MaxUsernameLength = 16
+
+const UsernamePrompt = "Welcome to budgetchat! What shall I call you?\n"
+
+const InvalidUsernameMessage = "Usernames must only contain ASCII letters, digits or underscores\n"
+
+const (
+	ClientReadTimeout  = time.Minute
+	ClientWriteTimeout = time.Second * 3
+)
+
+func isUsernameValid(username []byte) bool {
+	if len(username) == 0 || len(username) > 16 {
+		return false
+	}
+
+	for _, b := range username {
+		if !((b >= 'A' && b <= 'z') || (b >= '0' && b <= '9') || b == '_') {
+			return false
+		}
+	}
+
+
+	return true
+}
+
+type Client struct {
+	// Client's underlying TCP connection.
+	conn net.Conn
+
+	// Protocol specifies that all messages are '\n' terminated
+	// so we can use a scanner for reading.
+	scanner *bufio.Scanner
+
+	// Client's username. Empty string indicates that they have not joined yet.
+	Username string
+}
+
+func NewClient(conn net.Conn) *Client {
+	return &Client{
+		conn: conn,
+		scanner:  bufio.NewScanner(conn),
+		Username: "",
+	}
+}
+
+func (c *Client) Joined() bool {
+	return c.Username != ""
+}
+
+func (c *Client) Write(data []byte) error {
+	c.conn.SetWriteDeadline(time.Now().Add(ClientWriteTimeout))
+	if _, err := c.conn.Write(data); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (c *Client) Read() ([]byte, error) {
+	if !c.scanner.Scan() {
+		err := c.scanner.Err()
+		if err == nil {
+			err = io.EOF
+		}
+
+		return nil, err
+	}
+	return c.scanner.Bytes(), nil
+}
+
+type Message struct {
+	Text string
+	Sender *Client
+}
+
+func NewMessage(text string, sender *Client) *Message {
+	return &Message{
+		Text: text,
+		Sender: sender,
+	}
+}
+
+func (msg *Message) String() string {
+	var b strings.Builder
+	b.WriteRune('[')
+	b.WriteString(msg.Sender.Username)
+	b.WriteString("] ")
+	b.WriteString(msg.Text)
+	return b.String()
+}
+
+type Server struct {
+	clients    []*Client
+	clientLock sync.RWMutex
+
+	// Channel for relaying messages between clients
+	messageChan chan *Message
+}
+
+func NewServer() *Server {
+	return &Server{
+		clients: []*Client{},
+		messageChan: make(chan *Message),
+	}
+}
+
+func (srv *Server) addClient(c *Client) {
+	srv.clientLock.Lock()
+	defer srv.clientLock.Unlock()
+
+	srv.clients = append(srv.clients, c)
+}
+
+func (srv *Server) removeClient(c *Client) {
+	srv.clientLock.Lock()
+	defer srv.clientLock.Unlock()
+
+	idx := slices.Index(srv.clients, c)
+	srv.clients = slices.Delete(srv.clients, idx, idx+1)
+}
+
+func (srv *Server) userJoined(c *Client) {
+	srv.clientLock.RLock()
+	defer srv.clientLock.RUnlock()
+
+	var b strings.Builder
+	b.WriteString("* ")
+	b.WriteString(c.Username)
+	b.WriteString(" has entered the room")
+
+	data := append([]byte(b.String()), '\n')
+
+	for _, recepient := range srv.clients {
+		if !recepient.Joined() || recepient == c {
+			continue
+		}
+
+		go func(client *Client) {
+			if err := client.Write(data); err != nil {
+				log.Fatalf("Write error: %v\n", err)
+			}
+		}(recepient)
+	}
+}
+
+func (srv *Server) userLeft(c *Client) {
+	srv.clientLock.RLock()
+	defer srv.clientLock.RUnlock()
+
+	var b strings.Builder
+	b.WriteString("* ")
+	b.WriteString(c.Username)
+	b.WriteString(" has left the room")
+
+	data := append([]byte(b.String()), '\n')
+
+	for _, recepient := range srv.clients {
+		if !recepient.Joined() || recepient == c {
+			continue
+		}
+
+		go func(client *Client) {
+			if err := client.Write(data); err != nil {
+				log.Fatalf("Write error: %v\n", err)
+			}
+		}(recepient)
+	}
+}
+
+func (srv *Server) relayMessages() {
+	for msg := range srv.messageChan {
+		srv.clientLock.RLock()
+
+		data := append([]byte(msg.String()), '\n')
+
+		for _, client := range srv.clients {
+			if !client.Joined() || client == msg.Sender {
+				continue
+			}
+
+			go func(client *Client) {
+				if err := client.Write(data); err != nil {
+					log.Fatalf("Write error: %v\n", err)
+				}
+			}(client)
+		}
+
+		srv.clientLock.RUnlock()
+	}
+}
+
+type Action string
+
+const (
+	ActionJoin  Action = "join"
+	ActionLeave Action = "leave"
+)
+
+type Notifier func(Action)
+
+type ClientHandler func(*Client, chan<- *Message, Notifier) error
+
+func (srv *Server) RunForever(address string, handler ClientHandler) error {
+	ln, err := net.Listen("tcp", address)
+	if err != nil {
+		return err
+	}
+
+	go srv.relayMessages()
+
+	for {
+		conn, err := ln.Accept()
+		if err != nil {
+			return err
+		}
+
+		client := NewClient(conn)
+		srv.addClient(client)
+
+		go func(client *Client) {
+			defer conn.Close()
+			defer srv.removeClient(client)
+
+			handler(client, srv.messageChan, func(act Action) {
+				switch act {
+				case ActionJoin:
+					srv.userJoined(client)
+				case ActionLeave:
+					srv.userLeft(client)
+				}
+			})
+		}(client)
+	}
+}
+
+func handleClient(c *Client, messageChan chan<- *Message, notify Notifier) error {
+	if err := c.Write([]byte(UsernamePrompt)); err != nil {
+		return err
+	}
+
+	username, _ := c.Read()
+	if !isUsernameValid(username) {
+		log.Printf("Client %v provided an invald username\n", c)
+		if err := c.Write([]byte(InvalidUsernameMessage)); err != nil {
+			return err
+		}
+	}
+
+	// Join the client
+	c.Username = string(username)
+
+	notify(ActionJoin)
+
+	for {
+		text, err := c.Read()
+		if err != nil {
+			if err == io.EOF {
+				break
+			}
+
+			log.Fatalf("Read error: %s\n", err)
+		}
+
+		msg  := NewMessage(string(text), c)
+		messageChan <- msg
+	}
+
+	notify(ActionLeave)
+	return nil
+}
+
+func main() {
+	server := NewServer()
+	
+	if err := server.RunForever(":10000", handleClient); err != nil {
+		log.Fatal(err)
+	}
+}
